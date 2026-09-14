@@ -13,7 +13,7 @@ import getpass
 import os
 import sys
 
-from .engine import Engine
+from .engine import Engine, format_size
 
 
 def _resolve_credentials(args):
@@ -64,6 +64,19 @@ def cmd_login(args):
     print(f"Logged in OK. Session cached at {engine.session_cache}")
 
 
+def cmd_estimate(args):
+    engine = _build_engine(args)
+    totals = engine.estimate()
+    print(f"\n{totals['categories']} product categories crawled.\n")
+    print(f"{'Group':<28}{'Files':>8}{'Size':>12}{'New files':>12}{'New size':>12}")
+    for group, s in sorted(totals["by_group"].items()):
+        print(f"{group:<28}{s['files']:>8}{format_size(s['bytes']):>12}{s['new_files']:>12}{format_size(s['new_bytes']):>12}")
+    print("-" * 72)
+    print(f"{'TOTAL':<28}{totals['files']:>8}{format_size(totals['bytes']):>12}{totals['new_files']:>12}{format_size(totals['new_bytes']):>12}")
+    print(f"\nAlready on disk: {totals['files'] - totals['new_files']} files, {format_size(totals['bytes'] - totals['new_bytes'])}")
+    print(f"Would download:  {totals['new_files']} files, {format_size(totals['new_bytes'])}")
+
+
 def cmd_scan(args):
     engine = _build_engine(args)
     new_groups = engine.full_scan()
@@ -108,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_login = sub.add_parser("login", parents=[common], help="Verify credentials and cache a session")
     p_login.set_defaults(func=cmd_login)
+
+    p_estimate = sub.add_parser("estimate", parents=[common],
+                                 help="Discovery-only dry run: report file counts/sizes without downloading anything")
+    p_estimate.set_defaults(func=cmd_estimate)
 
     p_scan = sub.add_parser("scan", parents=[common], help="Full crawl of every product category")
     p_scan.set_defaults(func=cmd_scan)

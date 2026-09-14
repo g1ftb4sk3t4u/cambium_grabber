@@ -31,10 +31,38 @@ DEFAULT_CATEGORY_WORKERS = 4
 DEFAULT_DOWNLOAD_WORKERS = 4
 
 _UNSAFE_PATH_CHARS = re.compile(r'[\\/:*?"<>|]')
+_SIZE_RE = re.compile(r'([\d.]+)\s*([kKmMgGtT]?[bB])')
+_SIZE_UNITS = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4}
 
 
 def _sanitize(name: str) -> str:
     return _UNSAFE_PATH_CHARS.sub("_", name).strip()
+
+
+def parse_size(size_text) -> int:
+    """"210.3 MB" / "127.7 kB" / "1.2 GB" -> bytes. Returns 0 for anything
+    that doesn't match (better to undercount a size estimate than crash on
+    a format Cambium's page happens to use that wasn't seen during testing).
+    """
+    if not size_text:
+        return 0
+    m = _SIZE_RE.search(size_text)
+    if not m:
+        return 0
+    value, unit = m.groups()
+    try:
+        return int(float(value) * _SIZE_UNITS.get(unit.lower(), 1))
+    except ValueError:
+        return 0
+
+
+def format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000:
+            return f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} TB"
 
 
 class Engine:
@@ -108,6 +136,59 @@ class Engine:
         priority_cats = [c for c in categories if self._is_priority(c)]
         other_cats = [c for c in categories if not self._is_priority(c)]
         return priority_cats, other_cats
+
+    # -- dry run / sizing ------------------------------------------------
+    def estimate(self):
+        """Discovery-only pass: crawl every category and release, tally
+        file counts/sizes, but don't download anything. Answers "how big
+        is this and how much is left" before committing to a real run -
+        useful given a full crawl across every product line can plausibly
+        run into the hundreds of GB (see the MikroTik tool's archive for a
+        sense of scale on a similarly old, many-version product catalog).
+        """
+        self._login()
+        categories = self._categories()
+        self.log(f"Found {len(categories)} product categories. Discovering releases (no downloads)...", "INFO")
+
+        totals = {"files": 0, "bytes": 0, "new_files": 0, "new_bytes": 0}
+        by_group = {}
+
+        def process(category: discovery.Category):
+            releases = discovery.discover_current_releases(self.session, category)
+            if self.include_archive:
+                releases += discovery.discover_archive_releases(self.session, category)
+            return category, releases
+
+        with ThreadPoolExecutor(max_workers=self.category_workers) as ex:
+            futures = [ex.submit(process, c) for c in categories]
+            for fut in as_completed(futures):
+                if self._stopped():
+                    continue
+                try:
+                    category, releases = fut.result()
+                except Exception as e:
+                    self.log(f"Failed to size category: {e}", "ERROR")
+                    continue
+
+                group_stats = by_group.setdefault(category.group, {"files": 0, "bytes": 0, "new_files": 0, "new_bytes": 0})
+                for release in releases:
+                    group_id = f"{category.slug}/{release.release_id}"
+                    for f in release.files:
+                        size = parse_size(f.size_text)
+                        already_have = self.manifest.has_file(group_id, _sanitize(f.filename))
+                        totals["files"] += 1
+                        totals["bytes"] += size
+                        group_stats["files"] += 1
+                        group_stats["bytes"] += size
+                        if not already_have:
+                            totals["new_files"] += 1
+                            totals["new_bytes"] += size
+                            group_stats["new_files"] += 1
+                            group_stats["new_bytes"] += size
+
+        totals["categories"] = len(categories)
+        totals["by_group"] = by_group
+        return totals
 
     # -- main entry points ---------------------------------------------
     def full_scan(self):

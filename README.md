@@ -65,6 +65,13 @@ pip install -r requirements.txt
 # Verify credentials and cache a session (do this first)
 python run.py login --output ./cambium_archive
 
+# Dry run: discover everything, report file counts/sizes, download nothing.
+# Do this before your first full scan - a complete crawl across every
+# product line can plausibly run into the hundreds of GB (see the MikroTik
+# tool's archive for a sense of scale on a similarly old product catalog).
+# Also useful after a partial run to see how much is left.
+python run.py estimate --output ./cambium_archive
+
 # Full crawl - current releases everywhere first, then archives everywhere
 python run.py scan --output ./cambium_archive
 
