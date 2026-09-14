@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.log
+cambium_archive/
+credentials.env
+.session.json
+.DS_Store
+*.swp

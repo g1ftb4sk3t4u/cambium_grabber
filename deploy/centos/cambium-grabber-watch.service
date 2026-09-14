@@ -1,0 +1,16 @@
+[Unit]
+Description=Cambium Networks Grabber - daily check for new releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cambium-grabber
+Group=cambium-grabber
+WorkingDirectory=/opt/cambium-grabber
+EnvironmentFile=/opt/cambium-grabber/credentials.env
+Environment=ARCHIVE_DIR=/data/cambium_archive
+ExecStart=/opt/cambium-grabber/venv/bin/python /opt/cambium-grabber/run.py watch --once --output ${ARCHIVE_DIR} --priority ePMP,PTP
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
