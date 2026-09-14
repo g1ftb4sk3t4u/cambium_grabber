@@ -41,6 +41,18 @@ def _resolve_credentials(args):
     env_file = _load_env_file(getattr(args, "env_file", None))
     email = args.email or os.environ.get("CAMBIUM_EMAIL") or env_file.get("CAMBIUM_EMAIL")
     password = args.password or os.environ.get("CAMBIUM_PASSWORD") or env_file.get("CAMBIUM_PASSWORD")
+
+    # If stdout isn't a real terminal (redirected to a log file, running
+    # under systemd, etc.), input()/getpass() would block forever waiting
+    # on a prompt nobody can see - looking exactly like the tool being
+    # stuck, with nothing printed anywhere. Fail loudly instead.
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if (not email or not password) and not interactive:
+        print("Missing credentials and no terminal to prompt on (output is redirected/non-interactive).", file=sys.stderr)
+        print(f"Checked: --email/--password flags, CAMBIUM_EMAIL/CAMBIUM_PASSWORD env vars, "
+              f"and {getattr(args, 'env_file', 'credentials.env')} (copy credentials.env.example and fill it in).", file=sys.stderr)
+        sys.exit(1)
+
     if not email:
         email = input("Cambium account email: ").strip()
     if not password:
