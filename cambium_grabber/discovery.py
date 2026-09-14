@@ -22,6 +22,16 @@ from bs4 import BeautifulSoup
 FILES_URL = "https://support.cambiumnetworks.com/files"
 
 
+class SessionExpired(Exception):
+    """The session got redirected to /login instead of the page we asked
+    for. A crawl across ~90 categories can genuinely outlast a session's
+    lifetime - without this check, a expired-mid-crawl session would just
+    silently parse the login page (0 releases found, no error) instead of
+    telling anyone what happened, which looks exactly like "the tool got
+    stuck" from the outside.
+    """
+
+
 class Category:
     def __init__(self, group, name, url):
         self.group = group          # e.g. "PMP"
@@ -51,6 +61,8 @@ def discover_categories(session):
     """Parse the /files tree page into every (group, category) pair."""
     r = session.get(FILES_URL, timeout=20)
     r.raise_for_status()
+    if "/login" in r.url:
+        raise SessionExpired()
     soup = BeautifulSoup(r.text, "html.parser")
 
     categories = []
@@ -94,12 +106,16 @@ def _parse_releases(html: str):
 def discover_current_releases(session, category: Category):
     r = session.get(category.url, timeout=20)
     r.raise_for_status()
+    if "/login" in r.url:
+        raise SessionExpired()
     return _parse_releases(r.text)
 
 
 def discover_archive_releases(session, category: Category):
     archive_url = urljoin(category.url, "archive")
     r = session.get(archive_url, timeout=20)
+    if "/login" in r.url:
+        raise SessionExpired()
     if r.status_code != 200:
         # Not every product line has an Archive tab - not an error.
         return []

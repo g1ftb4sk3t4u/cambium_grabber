@@ -12,6 +12,7 @@ server-side as far as we've seen.
 """
 
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -97,6 +98,8 @@ class Engine:
 
         self.session_cache = self.output_dir / ".session.json"
         self.manifest = Manifest(self.output_dir)
+        self._progress_lock = threading.Lock()
+        self._failed_files = []
 
     def _emit(self, kind: str, **payload):
         self._on_event({"type": kind, **payload})
@@ -120,6 +123,22 @@ class Engine:
             self.log("Logged in (fresh session).", "INFO")
         else:
             self.log("Reusing cached session.", "INFO")
+
+    def _discover_with_reauth(self, fn, *args):
+        """Call a discovery.py function; if the session expired mid-crawl
+        (discovery.SessionExpired - a real risk crawling ~90 categories,
+        which can take long enough to outlast a session), log back in once
+        and retry. Without this, an expired session silently parsed the
+        login page as if it were the requested page (0 releases found, no
+        error) - which looked exactly like the tool being stuck.
+        """
+        try:
+            return fn(self.session, *args)
+        except discovery.SessionExpired:
+            self.log("Session expired mid-crawl, re-authenticating...", "WARNING")
+            auth.login(self.session, self.email, self.password)
+            auth.save_session(self.session, self.session_cache)
+            return fn(self.session, *args)
 
     # -- discovery ----------------------------------------------------
     def _categories(self):
@@ -154,9 +173,9 @@ class Engine:
         by_group = {}
 
         def process(category: discovery.Category):
-            releases = discovery.discover_current_releases(self.session, category)
+            releases = self._discover_with_reauth(discovery.discover_current_releases, category)
             if self.include_archive:
-                releases += discovery.discover_archive_releases(self.session, category)
+                releases = releases + self._discover_with_reauth(discovery.discover_archive_releases, category)
             return category, releases
 
         with ThreadPoolExecutor(max_workers=self.category_workers) as ex:
@@ -211,6 +230,7 @@ class Engine:
         enough (under 100 categories) that a full crawl is the cheap
         operation here, so scan and watch both just do this.
         """
+        self._failed_files = []
         self._login()
         categories = self._categories()
         self.log(f"Found {len(categories)} product categories.", "INFO")
@@ -231,6 +251,12 @@ class Engine:
         self.manifest.mark_full_scan()
         self.manifest.save()
         self.log(f"Scan complete: {len(new_groups)} new release group(s) downloaded.", "SUCCESS")
+        if self._failed_files:
+            self.log(f"{len(self._failed_files)} file(s) failed after all retries:", "ERROR")
+            for f in self._failed_files:
+                self.log(f"  [{f['group']}] {f['filename']}: {f['error']}", "ERROR")
+        else:
+            self.log("No failed files.", "SUCCESS")
         return new_groups
 
     def watch_once(self):
@@ -246,8 +272,10 @@ class Engine:
     # -- per-category work -----------------------------------------------
     def _run_phase(self, categories, phase: str, label: str = ""):
         tag = f"{label}/{phase}" if label else phase
-        self.log(f"Starting '{tag}' pass across {len(categories)} categories...", "INFO")
+        total = len(categories)
+        self.log(f"Starting '{tag}' pass across {total} categories...", "INFO")
         new_groups = []
+        done = 0
         with ThreadPoolExecutor(max_workers=self.category_workers) as ex:
             futures = {ex.submit(self._process_category, c, phase): c for c in categories}
             for fut in as_completed(futures):
@@ -258,15 +286,23 @@ class Engine:
                     new_groups.extend(fut.result())
                 except Exception as e:
                     self.log(f"Failed to process category {cat.name} ({phase}): {e}", "ERROR")
+                done += 1
+                stats = self.manifest.data["stats"]
+                self.log(
+                    f"[{tag}] {done}/{total} categories done | "
+                    f"files: {stats['files_downloaded']} ok, {stats['files_failed']} failed, {stats['files_skipped']} skipped | "
+                    f"{format_size(stats['bytes_downloaded'])} downloaded so far",
+                    "PROGRESS",
+                )
         return new_groups
 
     def _process_category(self, category: discovery.Category, phase: str):
         if self._stopped():
             return []
         if phase == "current":
-            releases = discovery.discover_current_releases(self.session, category)
+            releases = self._discover_with_reauth(discovery.discover_current_releases, category)
         else:
-            releases = discovery.discover_archive_releases(self.session, category)
+            releases = self._discover_with_reauth(discovery.discover_archive_releases, category)
 
         new_groups = []
         for release in releases:
@@ -350,6 +386,8 @@ class Engine:
             self.log(f"Failed: {filename}: {e}", "ERROR")
             self.manifest.bump_stat("files_failed")
             self._emit("stat", key="files_failed", amount=1)
+            with self._progress_lock:
+                self._failed_files.append({"group": group_id, "filename": filename, "error": str(e)})
             try:
                 if out_path.exists():
                     out_path.unlink()
