@@ -2,10 +2,13 @@
 --once for cron/systemd) plus a `login` subcommand for verifying credentials
 and priming the cached session before the first scheduled run.
 
-Credentials: prefer the CAMBIUM_EMAIL / CAMBIUM_PASSWORD environment
-variables (systemd's EnvironmentFile= is the intended way to supply these -
-see deploy/centos) over --email/--password, since command-line args are
-visible to anyone on the box via `ps`.
+Credentials, in priority order: --email/--password flags, then the
+CAMBIUM_EMAIL/CAMBIUM_PASSWORD environment variables (systemd's
+EnvironmentFile= is how deploy/centos supplies these), then a local
+credentials.env file (copy credentials.env.example - each person filling in
+their own account, or a shared non-personal one your team sets up for this,
+rather than one baked into the tool), then an interactive prompt as a last
+resort.
 """
 
 import argparse
@@ -16,15 +19,36 @@ import sys
 from .engine import Engine, format_size
 
 
+def _load_env_file(path):
+    """Parse a simple KEY=VALUE file (# comments, blank lines ignored).
+    Deliberately not python-dotenv - this is the one thing it needs, no
+    reason to add a dependency for it.
+    """
+    values = {}
+    if not path or not os.path.isfile(path):
+        return values
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
 def _resolve_credentials(args):
-    email = args.email or os.environ.get("CAMBIUM_EMAIL")
-    password = args.password or os.environ.get("CAMBIUM_PASSWORD")
+    env_file = _load_env_file(getattr(args, "env_file", None))
+    email = args.email or os.environ.get("CAMBIUM_EMAIL") or env_file.get("CAMBIUM_EMAIL")
+    password = args.password or os.environ.get("CAMBIUM_PASSWORD") or env_file.get("CAMBIUM_PASSWORD")
     if not email:
         email = input("Cambium account email: ").strip()
     if not password:
         password = getpass.getpass("Cambium account password: ")
     if not email or not password:
-        print("Both an email and password are required (CAMBIUM_EMAIL / CAMBIUM_PASSWORD or --email/--password).", file=sys.stderr)
+        print("Both an email and password are required "
+              "(--email/--password, CAMBIUM_EMAIL/CAMBIUM_PASSWORD, or a credentials.env file - see credentials.env.example).",
+              file=sys.stderr)
         sys.exit(1)
     return email, password
 
@@ -105,8 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--output", default="./cambium_archive", help="Archive output directory")
-    common.add_argument("--email", default=None, help="Cambium account email (or CAMBIUM_EMAIL env var)")
-    common.add_argument("--password", default=None, help="Cambium account password (or CAMBIUM_PASSWORD env var - preferred)")
+    common.add_argument("--email", default=None, help="Cambium account email (or CAMBIUM_EMAIL env var / credentials.env)")
+    common.add_argument("--password", default=None, help="Cambium account password (or CAMBIUM_PASSWORD env var / credentials.env - preferred over this flag)")
+    common.add_argument("--env-file", default="credentials.env",
+                         help="Path to a KEY=VALUE credentials file (copy credentials.env.example). Default: ./credentials.env")
     common.add_argument("--dl-workers", type=int, default=4, help="Concurrent download workers")
     common.add_argument("--category-workers", type=int, default=4, help="Concurrent category-crawl workers")
     common.add_argument("--retries", type=int, default=3, help="Max retries per file")

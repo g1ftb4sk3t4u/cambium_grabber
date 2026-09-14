@@ -65,12 +65,11 @@ sudo -u "$SERVICE_USER" "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/req
 echo "==> Creating credentials file (fill this in before starting the timer!)"
 CREDS_FILE="$INSTALL_DIR/credentials.env"
 if [[ ! -f "$CREDS_FILE" ]]; then
-    cat > "$CREDS_FILE" <<'EOF'
-# Cambium account used for automated logins. This file is read by systemd's
-# EnvironmentFile= - keep it out of git, keep it mode 600.
-CAMBIUM_EMAIL=
-CAMBIUM_PASSWORD=
-EOF
+    # Same template everyone else fills in for a local/ad-hoc run
+    # (credentials.env.example) - one source of truth for what this file
+    # needs to contain. This is the account systemd's EnvironmentFile=
+    # reads for the scheduled service - keep it out of git, keep it 600.
+    cp "$INSTALL_DIR/credentials.env.example" "$CREDS_FILE"
 fi
 chown "$SERVICE_USER":"$SERVICE_USER" "$CREDS_FILE"
 chmod 600 "$CREDS_FILE"

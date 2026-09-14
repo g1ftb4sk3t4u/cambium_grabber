@@ -59,6 +59,25 @@ files; the real ones ship inside these per-release zips instead.)
 pip install -r requirements.txt
 ```
 
+## Credentials
+
+Every user needs their own Cambium account entry - there's no account baked
+into the tool. Copy the template and fill it in:
+
+```bash
+cp credentials.env.example credentials.env
+# edit credentials.env: CAMBIUM_EMAIL=... / CAMBIUM_PASSWORD=...
+```
+
+`credentials.env` is gitignored - it never gets committed. Anyone else
+running this (a coworker, another box) does the same with their own
+account, or a shared non-personal account your team sets up specifically
+for this automation - see the **Read this first** section above on why
+whoever's account goes in here is the one taking on the account-risk.
+Precedence if more than one is set: `--email`/`--password` flags >
+`CAMBIUM_EMAIL`/`CAMBIUM_PASSWORD` environment variables (how
+`deploy/centos` supplies them) > `credentials.env` > interactive prompt.
+
 ## Usage
 
 ```bash
