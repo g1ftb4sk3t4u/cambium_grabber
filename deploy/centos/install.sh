@@ -47,20 +47,11 @@ fi
 echo "==> Creating service user"
 id -u "$SERVICE_USER" &>/dev/null || useradd --system --home-dir "$INSTALL_DIR" --shell /sbin/nologin "$SERVICE_USER"
 
-if [[ "$(cd "$REPO_SRC" && pwd)" == "$(mkdir -p "$INSTALL_DIR" && cd "$INSTALL_DIR" && pwd)" ]]; then
-    # INSTALL_DIR points at the same checkout install.sh is running from
-    # (e.g. you set INSTALL_DIR to wherever you uploaded the repo, instead
-    # of the default separate /opt/cambium-grabber) - rsyncing a directory
-    # into itself is pointless and, with --delete, not something to risk.
-    # Run in place instead.
-    echo "==> Running in place at $INSTALL_DIR (no separate install location)"
-else
-    echo "==> Syncing application code to $INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR"
-    rsync -a --delete \
-        --exclude='.git' --exclude='cambium_archive' --exclude='venv' --exclude='.venv' --exclude='__pycache__' \
-        "$REPO_SRC/" "$INSTALL_DIR/"
-fi
+echo "==> Syncing application code to $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+rsync -a --delete \
+    --exclude='.git' --exclude='cambium_archive' --exclude='venv' --exclude='.venv' --exclude='__pycache__' \
+    "$REPO_SRC/" "$INSTALL_DIR/"
 
 echo "==> Creating archive directory: $ARCHIVE_DIR"
 mkdir -p "$ARCHIVE_DIR"
