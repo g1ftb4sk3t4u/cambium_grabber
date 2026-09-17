@@ -66,12 +66,43 @@ def format_size(num_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
+class RateLimiter:
+    """Thread-safe token bucket, shared across every download thread, so
+    --max-mbps caps the crawl's *aggregate* throughput - not just one
+    file's speed, which would do nothing useful with multiple concurrent
+    workers each free to max out the connection on their own. Concurrency
+    settings (--dl-workers/--category-workers) control how many streams run
+    at once; this is the only thing that actually caps total bandwidth.
+    """
+
+    def __init__(self, bytes_per_sec):
+        self.bytes_per_sec = bytes_per_sec
+        self._lock = threading.Lock()
+        self._tokens = bytes_per_sec
+        self._last = time.monotonic()
+
+    def consume(self, n: int):
+        if not self.bytes_per_sec:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.bytes_per_sec, self._tokens + (now - self._last) * self.bytes_per_sec)
+                self._last = now
+                if self._tokens >= n:
+                    self._tokens -= n
+                    return
+                deficit = n - self._tokens
+            time.sleep(min(deficit / self.bytes_per_sec, 0.5))
+
+
 class Engine:
     def __init__(self, output_dir: str, email: str, password: str,
                  category_workers: int = DEFAULT_CATEGORY_WORKERS,
                  download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
                  max_retries: int = 3, include_archive: bool = True,
-                 category_filter=None, priority=None, on_event=None, stop_flag=None):
+                 category_filter=None, priority=None, max_mbps=None,
+                 on_event=None, stop_flag=None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.email = email
@@ -81,6 +112,9 @@ class Engine:
         self.max_retries = max_retries
         self.include_archive = include_archive
         self.category_filter = category_filter  # optional set of slugs to restrict to
+        # Megabits/sec -> bytes/sec (standard bandwidth-cap unit, matches how
+        # a datacenter connection's limit is usually quoted). None = no cap.
+        self._rate_limiter = RateLimiter(max_mbps * 1_000_000 / 8) if max_mbps else None
         # Priority group/category names (case-insensitive, matched against
         # group, category name, or slug) - these get fully crawled (current
         # + archive) before anything else starts, rather than just sorted
@@ -364,6 +398,8 @@ class Engine:
                 for chunk in resp.iter_content(chunk_size=64 * 1024):
                     if not chunk:
                         continue
+                    if self._rate_limiter:
+                        self._rate_limiter.consume(len(chunk))
                     f.write(chunk)
                     downloaded += len(chunk)
                     if self._stopped():

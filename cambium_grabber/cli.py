@@ -88,6 +88,7 @@ def _build_engine(args) -> Engine:
         include_archive=not args.no_archive,
         category_filter=category_filter,
         priority=priority,
+        max_mbps=args.max_mbps,
         on_event=_console_event_handler(args.verbose),
     )
 
@@ -153,6 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Comma-separated group/category names to fully finish (current+archive) before anything else, "
                               "e.g. --priority ePMP,PTP (matched case-insensitively against group, category name, and slug)")
     common.add_argument("--no-archive", action="store_true", help="Skip each product's Archive tab, current releases only")
+    common.add_argument("--max-mbps", type=float, default=None,
+                         help="Cap aggregate download speed in megabits/sec across all workers combined (default: unlimited - "
+                              "nothing currently stops this from saturating the connection, so set this on a shared/limited link)")
     common.add_argument("-v", "--verbose", action="store_true", help="Show INFO-level logs, not just findings/errors")
 
     sub = parser.add_subparsers(dest="command")
