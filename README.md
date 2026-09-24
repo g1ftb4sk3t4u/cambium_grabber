@@ -113,6 +113,11 @@ python run.py watch --once --output ./cambium_archive
 # no cap by default, so set this on a shared/limited connection.
 python run.py scan --output ./cambium_archive --max-mbps 50
 
+# --min-delay (default 2.0s) paces every request proactively - a standing
+# gap between requests, not a reaction to already being rate-limited. Set
+# to 0 to disable if you want the old fire-as-fast-as-possible behavior.
+python run.py scan --output ./cambium_archive --min-delay 3
+
 # Go easier on the server - fewer concurrent requests to begin with
 python run.py scan --output ./cambium_archive --dl-workers 1 --category-workers 1
 ```
@@ -131,9 +136,14 @@ Cambium started actively rate-limiting (2026-09-24) - real `429 Too Many
 Requests` responses, not seen at all during earlier testing. This is
 handled properly rather than just retried blindly:
 
-- A file that gets 429'd is **deferred**, not retried inline - it doesn't
-  block progress on everything else still waiting. The bulk of a scan
-  completes first.
+- **`--min-delay` (default 2.0s)** proactively paces every request, shared
+  across all workers - a standing gap, not a reaction to already being
+  rate-limited (2026-09-24 testing: confirmed live against the real 429s -
+  cheap insurance, since avoiding even one 429 saves far more time than
+  the delay costs).
+- A file that gets 429'd anyway is **deferred**, not retried inline - it
+  doesn't block progress on everything else still waiting. The bulk of a
+  scan completes first.
 - After the main crawl finishes, a **patient retry pass** goes back
   through everything that was deferred - `--retry-passes` (default 3) with
   `--retry-pause` seconds (default 300 = 5 min) between each pass, since by

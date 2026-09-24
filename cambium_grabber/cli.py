@@ -89,6 +89,7 @@ def _build_engine(args) -> Engine:
         category_filter=category_filter,
         priority=priority,
         max_mbps=args.max_mbps,
+        min_delay=args.min_delay,
         deferred_retry_passes=args.retry_passes,
         deferred_retry_pause=args.retry_pause,
         on_event=_console_event_handler(args.verbose),
@@ -159,6 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--max-mbps", type=float, default=None,
                          help="Cap aggregate download speed in megabits/sec across all workers combined (default: unlimited - "
                               "nothing currently stops this from saturating the connection, so set this on a shared/limited link)")
+    common.add_argument("--min-delay", type=float, default=2.0,
+                         help="Minimum seconds between the start of consecutive requests, shared across every worker "
+                              "(default: 2.0). Proactive spacing, not a reaction to being rate-limited - cheap insurance, "
+                              "since avoiding one 429 saves far more time than this costs (each one triggers a shared "
+                              "backoff pause up to 5 minutes long). Set to 0 to disable.")
     common.add_argument("--retry-passes", type=int, default=3,
                          help="How many patient cleanup passes to make over rate-limited (429) files after the main crawl finishes "
                               "(default: 3). A pass with nothing deferred is skipped instantly, so this costs nothing when unneeded.")

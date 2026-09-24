@@ -103,6 +103,36 @@ class RateLimiter:
             time.sleep(min(deficit / self.bytes_per_sec, 0.5))
 
 
+class RequestPacer:
+    """Enforces a minimum gap between the *start* of consecutive requests,
+    shared across every thread - a standing pace, not a reaction to
+    already having been rate-limited. Cheap insurance: avoiding one 429 is
+    worth far more than the delay costs, since a single 429 triggers a
+    shared backoff pause up to 5 minutes long (RateLimitBackoff) - a
+    fraction of a second of proactive spacing pays for itself many times
+    over if it prevents even one of those.
+
+    Only paces when a new request is about to start - doesn't hold up
+    downloads already in flight, so it limits request *rate*, not
+    concurrency (that's still --dl-workers/--category-workers).
+    """
+
+    def __init__(self, min_delay):
+        self.min_delay = min_delay
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self):
+        if not self.min_delay:
+            return
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.min_delay
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
 class RateLimitBackoff:
     """Coordinates every thread's response to a 429 - shared, not
     per-thread. Without this, each thread's independent retry-with-backoff
@@ -158,7 +188,7 @@ class Engine:
                  category_workers: int = DEFAULT_CATEGORY_WORKERS,
                  download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
                  max_retries: int = 3, include_archive: bool = True,
-                 category_filter=None, priority=None, max_mbps=None,
+                 category_filter=None, priority=None, max_mbps=None, min_delay=None,
                  deferred_retry_passes: int = 3, deferred_retry_pause: float = 300.0,
                  on_event=None, stop_flag=None):
         self.output_dir = Path(output_dir)
@@ -173,6 +203,7 @@ class Engine:
         # Megabits/sec -> bytes/sec (standard bandwidth-cap unit, matches how
         # a datacenter connection's limit is usually quoted). None = no cap.
         self._rate_limiter = RateLimiter(max_mbps * 1_000_000 / 8) if max_mbps else None
+        self._pacer = RequestPacer(min_delay) if min_delay else None
         self._backoff = RateLimitBackoff()
         # 429'd files get deferred (not retried inline) so a rate-limited
         # file doesn't block the rest of the crawl from making progress on
@@ -240,6 +271,8 @@ class Engine:
           downloads, so a generous retry budget here costs little.
         """
         self._backoff.wait_if_paused()
+        if self._pacer:
+            self._pacer.wait()
         try:
             return fn(self.session, *args)
         except discovery.SessionExpired:
@@ -253,6 +286,8 @@ class Engine:
                 self.log(f"Rate limited (429) during discovery, attempt {attempt}/{max_rate_limit_attempts} - "
                          f"backing off {delay:.0f}s...", "WARNING")
                 self._backoff.wait_if_paused()
+                if self._pacer:
+                    self._pacer.wait()
                 try:
                     return fn(self.session, *args)
                 except discovery.RateLimited as e2:
@@ -520,6 +555,8 @@ class Engine:
             return True
 
         self._backoff.wait_if_paused()
+        if self._pacer:
+            self._pacer.wait()
         try:
             resp = self.session.get(file_meta.url, timeout=60, stream=True)
             if resp.status_code == 404:
