@@ -108,6 +108,13 @@ python run.py scan --output ./cambium_archive --no-archive
 
 # Single daily-style check (cron/systemd friendly)
 python run.py watch --once --output ./cambium_archive
+
+# Cap total bandwidth (megabits/sec, aggregate across all workers) - there's
+# no cap by default, so set this on a shared/limited connection.
+python run.py scan --output ./cambium_archive --max-mbps 50
+
+# Go easier on the server - fewer concurrent requests to begin with
+python run.py scan --output ./cambium_archive --dl-workers 1 --category-workers 1
 ```
 
 Credentials: `CAMBIUM_EMAIL` / `CAMBIUM_PASSWORD` environment variables
@@ -117,6 +124,33 @@ and reused until it actually expires, so a scheduled run isn't logging in
 fresh every time.
 
 Run `python run.py --help` / `scan --help` / `watch --help` for every flag.
+
+## Rate limiting (429s)
+
+Cambium started actively rate-limiting (2026-09-24) - real `429 Too Many
+Requests` responses, not seen at all during earlier testing. This is
+handled properly rather than just retried blindly:
+
+- A file that gets 429'd is **deferred**, not retried inline - it doesn't
+  block progress on everything else still waiting. The bulk of a scan
+  completes first.
+- After the main crawl finishes, a **patient retry pass** goes back
+  through everything that was deferred - `--retry-passes` (default 3) with
+  `--retry-pause` seconds (default 300 = 5 min) between each pass, since by
+  then the server's had a real chance to cool down and it's a much smaller,
+  focused list.
+- Every download/discovery thread shares one backoff clock - one 429
+  anywhere pauses the *whole* crawl together (honoring `Retry-After` when
+  Cambium sends one), instead of each thread retrying independently and
+  immediately re-triggering the same limit.
+- Anything still rate-limited after every pass is exhausted lands in the
+  final failed-files report (see below) - explicit about what still needs
+  a manual look or a later re-run, not silently missing.
+
+If you're hitting 429s consistently even single-threaded, that's the
+server asking for real patience, not a faster rate - let a run span
+multiple days if it needs to (it's fully resumable) rather than trying to
+tune around the limit.
 
 ## Download order: newest first, your priorities first
 

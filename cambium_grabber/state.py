@@ -29,6 +29,7 @@ class Manifest:
                 "groups_found": 0,
                 "files_downloaded": 0,
                 "files_skipped": 0,
+                "files_deferred": 0,
                 "files_failed": 0,
                 "bytes_downloaded": 0,
             },

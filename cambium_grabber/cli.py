@@ -89,6 +89,8 @@ def _build_engine(args) -> Engine:
         category_filter=category_filter,
         priority=priority,
         max_mbps=args.max_mbps,
+        deferred_retry_passes=args.retry_passes,
+        deferred_retry_pause=args.retry_pause,
         on_event=_console_event_handler(args.verbose),
     )
 
@@ -157,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--max-mbps", type=float, default=None,
                          help="Cap aggregate download speed in megabits/sec across all workers combined (default: unlimited - "
                               "nothing currently stops this from saturating the connection, so set this on a shared/limited link)")
+    common.add_argument("--retry-passes", type=int, default=3,
+                         help="How many patient cleanup passes to make over rate-limited (429) files after the main crawl finishes "
+                              "(default: 3). A pass with nothing deferred is skipped instantly, so this costs nothing when unneeded.")
+    common.add_argument("--retry-pause", type=float, default=300.0,
+                         help="Seconds to wait before each retry pass after the first (default: 300 = 5 minutes) - "
+                              "a real cooldown for the server, not just the per-request backoff.")
     common.add_argument("-v", "--verbose", action="store_true", help="Show INFO-level logs, not just findings/errors")
 
     sub = parser.add_subparsers(dest="command")

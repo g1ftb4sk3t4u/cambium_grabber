@@ -159,6 +159,7 @@ class Engine:
                  download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
                  max_retries: int = 3, include_archive: bool = True,
                  category_filter=None, priority=None, max_mbps=None,
+                 deferred_retry_passes: int = 3, deferred_retry_pause: float = 300.0,
                  on_event=None, stop_flag=None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -173,6 +174,13 @@ class Engine:
         # a datacenter connection's limit is usually quoted). None = no cap.
         self._rate_limiter = RateLimiter(max_mbps * 1_000_000 / 8) if max_mbps else None
         self._backoff = RateLimitBackoff()
+        # 429'd files get deferred (not retried inline) so a rate-limited
+        # file doesn't block the rest of the crawl from making progress on
+        # everything else - they all get a real, patient retry pass at the
+        # end instead, after the bulk of the work is already done.
+        self.deferred_retry_passes = max(0, deferred_retry_passes)
+        self.deferred_retry_pause = deferred_retry_pause
+        self._deferred_files = []
         # Priority group/category names (case-insensitive, matched against
         # group, category name, or slug) - these get fully crawled (current
         # + archive) before anything else starts, rather than just sorted
@@ -343,6 +351,7 @@ class Engine:
         operation here, so scan and watch both just do this.
         """
         self._failed_files = []
+        self._deferred_files = []
         self._login()
         categories = self._categories()
         self.log(f"Found {len(categories)} product categories.", "INFO")
@@ -360,16 +369,63 @@ class Engine:
             if self.include_archive and not self._stopped():
                 new_groups.extend(self._run_phase(cats, "archive", label))
 
+        if self._deferred_files and not self._stopped():
+            self._retry_deferred_files()
+
         self.manifest.mark_full_scan()
         self.manifest.save()
         self.log(f"Scan complete: {len(new_groups)} new release group(s) downloaded.", "SUCCESS")
         if self._failed_files:
-            self.log(f"{len(self._failed_files)} file(s) failed after all retries:", "ERROR")
+            self.log(f"{len(self._failed_files)} file(s) still missing after all retries/passes:", "ERROR")
             for f in self._failed_files:
                 self.log(f"  [{f['group']}] {f['filename']}: {f['error']}", "ERROR")
         else:
-            self.log("No failed files.", "SUCCESS")
+            self.log("No failed or still-missing files.", "SUCCESS")
         return new_groups
+
+    def _retry_deferred_files(self):
+        """A dedicated, patient cleanup pass over everything that got 429'd
+        during the main crawl - run after the bulk of the work is already
+        done, since by then the server's had a real chance to cool down and
+        there's a much smaller, focused list to work through. Anything
+        still deferred after every pass is exhausted moves to the final
+        failed-files report so it's explicit what still needs a manual
+        look or a later re-run, rather than silently vanishing.
+        """
+        for pass_num in range(1, self.deferred_retry_passes + 1):
+            if not self._deferred_files or self._stopped():
+                break
+            pending = self._deferred_files
+            self._deferred_files = []
+            if pass_num > 1:
+                self.log(f"Waiting {self.deferred_retry_pause:.0f}s before retry pass {pass_num} "
+                         f"to give the server a real cooldown...", "INFO")
+                time.sleep(self.deferred_retry_pause)
+            self.log(f"Retry pass {pass_num}/{self.deferred_retry_passes}: "
+                     f"{len(pending)} previously rate-limited file(s) to retry...", "INFO")
+            with ThreadPoolExecutor(max_workers=self.download_workers) as ex:
+                futures = [ex.submit(self._download_file, d["group_id"], d["subdir"], d["file_meta"]) for d in pending]
+                for fut in as_completed(futures):
+                    if self._stopped():
+                        break
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        self.log(f"Unexpected error on deferred retry: {e}", "ERROR")
+            self.manifest.save()
+
+        if self._deferred_files:
+            self.log(f"{len(self._deferred_files)} file(s) still rate-limited after "
+                     f"{self.deferred_retry_passes} retry pass(es) - marking as missing.", "WARNING")
+            with self._progress_lock:
+                for d in self._deferred_files:
+                    self._failed_files.append({
+                        "group": d["group_id"],
+                        "filename": _sanitize(d["file_meta"].filename),
+                        "error": f"Still rate-limited (429) after {self.deferred_retry_passes} retry pass(es)",
+                    })
+            self.manifest.bump_stat("files_failed", len(self._deferred_files))
+            self._deferred_files = []
 
     def watch_once(self):
         """Same crawl as full_scan (see note above on why); kept as a
@@ -402,7 +458,8 @@ class Engine:
                 stats = self.manifest.data["stats"]
                 self.log(
                     f"[{tag}] {done}/{total} categories done | "
-                    f"files: {stats['files_downloaded']} ok, {stats['files_failed']} failed, {stats['files_skipped']} skipped | "
+                    f"files: {stats['files_downloaded']} ok, {stats.get('files_deferred', 0)} deferred (429), "
+                    f"{stats['files_failed']} failed, {stats['files_skipped']} skipped | "
                     f"{format_size(stats['bytes_downloaded'])} downloaded so far",
                     "PROGRESS",
                 )
@@ -444,8 +501,12 @@ class Engine:
                 except Exception as e:
                     self.log(f"Unexpected download error: {e}", "ERROR")
 
-    def _download_file(self, group_id: str, subdir: Path, file_meta: discovery.ReleaseFile,
-                        retry: int = 0, rate_limit_retry: int = 0, max_rate_limit_retries: int = 12) -> bool:
+    def _download_file(self, group_id: str, subdir: Path, file_meta: discovery.ReleaseFile, retry: int = 0):
+        """Returns True (downloaded or already had it), False (permanent
+        404), or None (429'd - deferred for a later retry pass rather than
+        blocking this thread on an inline backoff, so one rate-limited file
+        doesn't stall progress on everything else still waiting).
+        """
         filename = _sanitize(file_meta.filename)
         out_path = subdir / filename
 
@@ -464,20 +525,14 @@ class Engine:
             if resp.status_code == 404:
                 return False
             if resp.status_code == 429:
-                # A generous, separate retry budget from the generic
-                # connection-error one below - a 429 means "you'll succeed,
-                # just not yet", not "something's actually broken". Every
-                # thread shares one backoff clock (RateLimitBackoff), so
-                # this pauses the whole crawl together instead of each
-                # thread retrying on its own schedule and immediately
-                # re-triggering the same limit.
-                if rate_limit_retry >= max_rate_limit_retries:
-                    raise requests.HTTPError(f"429 Too Many Requests for {filename} (gave up after {max_rate_limit_retries} backoffs)")
                 delay = self._backoff.trigger(resp.headers.get("Retry-After"))
-                self.log(f"Rate limited (429) on {filename}, attempt {rate_limit_retry + 1}/{max_rate_limit_retries} - "
-                         f"backing off {delay:.0f}s...", "WARNING")
-                self._backoff.wait_if_paused()
-                return self._download_file(group_id, subdir, file_meta, retry, rate_limit_retry + 1, max_rate_limit_retries)
+                self.log(f"Rate limited (429) on {filename} - deferring for a later retry pass "
+                         f"(shared backoff now {delay:.0f}s)", "WARNING")
+                with self._progress_lock:
+                    self._deferred_files.append({"group_id": group_id, "subdir": subdir, "file_meta": file_meta})
+                self._emit("stat", key="files_deferred", amount=1)
+                self.manifest.bump_stat("files_deferred")
+                return None
             if "/login" in resp.url:
                 # Session expired mid-crawl (long historical crawls can outlast
                 # a session lifetime) - re-auth once and retry this file.
