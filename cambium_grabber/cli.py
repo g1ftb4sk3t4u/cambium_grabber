@@ -16,7 +16,7 @@ import getpass
 import os
 import sys
 
-from .engine import Engine, format_size
+from .engine import DEFAULT_CATEGORY_WORKERS, DEFAULT_DOWNLOAD_WORKERS, Engine, format_size
 
 
 def _load_env_file(path):
@@ -146,8 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--password", default=None, help="Cambium account password (or CAMBIUM_PASSWORD env var / credentials.env - preferred over this flag)")
     common.add_argument("--env-file", default="credentials.env",
                          help="Path to a KEY=VALUE credentials file (copy credentials.env.example). Default: ./credentials.env")
-    common.add_argument("--dl-workers", type=int, default=4, help="Concurrent download workers")
-    common.add_argument("--category-workers", type=int, default=4, help="Concurrent category-crawl workers")
+    common.add_argument("--dl-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS, help="Concurrent download workers")
+    common.add_argument("--category-workers", type=int, default=DEFAULT_CATEGORY_WORKERS, help="Concurrent category-crawl workers")
     common.add_argument("--retries", type=int, default=3, help="Max retries per file")
     common.add_argument("--categories", default=None, help="Comma-separated category slugs to restrict to (default: all)")
     common.add_argument("--priority", default=None,

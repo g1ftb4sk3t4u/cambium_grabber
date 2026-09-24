@@ -32,6 +32,28 @@ class SessionExpired(Exception):
     """
 
 
+class RateLimited(Exception):
+    """A 429 Too Many Requests. Carries the Retry-After header (seconds) if
+    the server sent one, so the caller can back off for the actual
+    requested duration instead of guessing.
+    """
+
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+        super().__init__(f"429 Too Many Requests (retry_after={retry_after})")
+
+
+def _check_response(r):
+    """Common checks before treating a response as real page content -
+    raise the specific, handleable exception instead of falling through to
+    a generic HTTPError that nothing upstream knows how to recover from."""
+    if r.status_code == 429:
+        raise RateLimited(r.headers.get("Retry-After"))
+    if "/login" in r.url:
+        raise SessionExpired()
+    r.raise_for_status()
+
+
 class Category:
     def __init__(self, group, name, url):
         self.group = group          # e.g. "PMP"
@@ -60,9 +82,7 @@ class Release:
 def discover_categories(session):
     """Parse the /files tree page into every (group, category) pair."""
     r = session.get(FILES_URL, timeout=20)
-    r.raise_for_status()
-    if "/login" in r.url:
-        raise SessionExpired()
+    _check_response(r)
     soup = BeautifulSoup(r.text, "html.parser")
 
     categories = []
@@ -105,15 +125,15 @@ def _parse_releases(html: str):
 
 def discover_current_releases(session, category: Category):
     r = session.get(category.url, timeout=20)
-    r.raise_for_status()
-    if "/login" in r.url:
-        raise SessionExpired()
+    _check_response(r)
     return _parse_releases(r.text)
 
 
 def discover_archive_releases(session, category: Category):
     archive_url = urljoin(category.url, "archive")
     r = session.get(archive_url, timeout=20)
+    if r.status_code == 429:
+        raise RateLimited(r.headers.get("Retry-After"))
     if "/login" in r.url:
         raise SessionExpired()
     if r.status_code != 200:

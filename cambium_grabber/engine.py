@@ -7,8 +7,12 @@ session.
 
 Concurrency defaults are deliberately modest (see DEFAULT_* below) - this
 is hitting a vendor portal as a logged-in person, not an anonymous public
-CDN, so it's worth not hammering it even though nothing here is rate-limited
-server-side as far as we've seen.
+CDN. Cambium started returning real 429 Too Many Requests responses
+(2026-09-24, mid-crawl) after not rate-limiting at all during earlier
+testing - RateLimitBackoff below handles that: every download/discovery
+thread shares one backoff clock, so a 429 anywhere pauses everything
+together instead of each thread independently retrying and immediately
+re-triggering the same limit.
 """
 
 import re
@@ -28,8 +32,11 @@ from .state import Manifest
 # this despite it being an active technical control, not just a ToS clause -
 # see project notes/conversation history.
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-DEFAULT_CATEGORY_WORKERS = 4
-DEFAULT_DOWNLOAD_WORKERS = 4
+# Lowered from 4/4 after Cambium started actively rate-limiting (429s) -
+# fewer concurrent streams means fewer requests/sec in the first place,
+# on top of the shared backoff that reacts once a limit is actually hit.
+DEFAULT_CATEGORY_WORKERS = 2
+DEFAULT_DOWNLOAD_WORKERS = 2
 
 _UNSAFE_PATH_CHARS = re.compile(r'[\\/:*?"<>|]')
 _SIZE_RE = re.compile(r'([\d.]+)\s*([kKmMgGtT]?[bB])')
@@ -96,6 +103,56 @@ class RateLimiter:
             time.sleep(min(deficit / self.bytes_per_sec, 0.5))
 
 
+class RateLimitBackoff:
+    """Coordinates every thread's response to a 429 - shared, not
+    per-thread. Without this, each thread's independent retry-with-backoff
+    (a few seconds) just re-triggers the same site-wide limit the instant
+    it wakes up, because every *other* thread is still hammering away at
+    full speed in the meantime. One thread hitting a 429 means the whole
+    crawl backs off together.
+
+    Delay grows with consecutive hits (capped) and resets once the crawl's
+    gone long enough without tripping the limit again - a Retry-After
+    header, when Cambium sends one, is honored as a floor rather than
+    guessed at.
+    """
+
+    def __init__(self, base_delay=30.0, max_delay=300.0, reset_after=90.0):
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.reset_after = reset_after
+        self._lock = threading.Lock()
+        self._pause_until = 0.0
+        self._consecutive_hits = 0
+        self._last_hit = 0.0
+
+    def wait_if_paused(self):
+        while True:
+            with self._lock:
+                remaining = self._pause_until - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 1.0))
+
+    def trigger(self, retry_after=None) -> float:
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last_hit > self.reset_after:
+                self._consecutive_hits = 0
+            self._consecutive_hits += 1
+            self._last_hit = now
+
+            computed = min(self.base_delay * (2 ** (self._consecutive_hits - 1)), self.max_delay)
+            try:
+                server_delay = float(retry_after) if retry_after is not None else 0.0
+            except (TypeError, ValueError):
+                server_delay = 0.0
+            delay = max(computed, server_delay)
+
+            self._pause_until = max(self._pause_until, now + delay)
+            return delay
+
+
 class Engine:
     def __init__(self, output_dir: str, email: str, password: str,
                  category_workers: int = DEFAULT_CATEGORY_WORKERS,
@@ -115,6 +172,7 @@ class Engine:
         # Megabits/sec -> bytes/sec (standard bandwidth-cap unit, matches how
         # a datacenter connection's limit is usually quoted). None = no cap.
         self._rate_limiter = RateLimiter(max_mbps * 1_000_000 / 8) if max_mbps else None
+        self._backoff = RateLimitBackoff()
         # Priority group/category names (case-insensitive, matched against
         # group, category name, or slug) - these get fully crawled (current
         # + archive) before anything else starts, rather than just sorted
@@ -158,14 +216,22 @@ class Engine:
         else:
             self.log("Reusing cached session.", "INFO")
 
-    def _discover_with_reauth(self, fn, *args):
-        """Call a discovery.py function; if the session expired mid-crawl
-        (discovery.SessionExpired - a real risk crawling ~90 categories,
-        which can take long enough to outlast a session), log back in once
-        and retry. Without this, an expired session silently parsed the
-        login page as if it were the requested page (0 releases found, no
-        error) - which looked exactly like the tool being stuck.
+    def _discover_with_reauth(self, fn, *args, max_rate_limit_attempts=12):
+        """Call a discovery.py function, handling the two recoverable
+        failure modes discovery.py can raise:
+
+        - SessionExpired: the session died mid-crawl (a real risk crawling
+          ~90 categories, which can outlast a session's lifetime) - log
+          back in once and retry. Without this, an expired session silently
+          parsed the login page as if it were the requested page (0
+          releases found, no error) - looked exactly like the tool being
+          stuck.
+        - RateLimited: a 429 - back off (shared across every thread, see
+          RateLimitBackoff) and retry, up to max_rate_limit_attempts times.
+          Discovery requests are cheap and infrequent compared to file
+          downloads, so a generous retry budget here costs little.
         """
+        self._backoff.wait_if_paused()
         try:
             return fn(self.session, *args)
         except discovery.SessionExpired:
@@ -173,6 +239,18 @@ class Engine:
             auth.login(self.session, self.email, self.password)
             auth.save_session(self.session, self.session_cache)
             return fn(self.session, *args)
+        except discovery.RateLimited as e:
+            for attempt in range(1, max_rate_limit_attempts + 1):
+                delay = self._backoff.trigger(e.retry_after)
+                self.log(f"Rate limited (429) during discovery, attempt {attempt}/{max_rate_limit_attempts} - "
+                         f"backing off {delay:.0f}s...", "WARNING")
+                self._backoff.wait_if_paused()
+                try:
+                    return fn(self.session, *args)
+                except discovery.RateLimited as e2:
+                    e = e2
+                    continue
+            raise
 
     # -- discovery ----------------------------------------------------
     def _categories(self):
@@ -366,7 +444,8 @@ class Engine:
                 except Exception as e:
                     self.log(f"Unexpected download error: {e}", "ERROR")
 
-    def _download_file(self, group_id: str, subdir: Path, file_meta: discovery.ReleaseFile, retry: int = 0) -> bool:
+    def _download_file(self, group_id: str, subdir: Path, file_meta: discovery.ReleaseFile,
+                        retry: int = 0, rate_limit_retry: int = 0, max_rate_limit_retries: int = 12) -> bool:
         filename = _sanitize(file_meta.filename)
         out_path = subdir / filename
 
@@ -379,10 +458,26 @@ class Engine:
             self.manifest.bump_stat("files_skipped")
             return True
 
+        self._backoff.wait_if_paused()
         try:
             resp = self.session.get(file_meta.url, timeout=60, stream=True)
             if resp.status_code == 404:
                 return False
+            if resp.status_code == 429:
+                # A generous, separate retry budget from the generic
+                # connection-error one below - a 429 means "you'll succeed,
+                # just not yet", not "something's actually broken". Every
+                # thread shares one backoff clock (RateLimitBackoff), so
+                # this pauses the whole crawl together instead of each
+                # thread retrying on its own schedule and immediately
+                # re-triggering the same limit.
+                if rate_limit_retry >= max_rate_limit_retries:
+                    raise requests.HTTPError(f"429 Too Many Requests for {filename} (gave up after {max_rate_limit_retries} backoffs)")
+                delay = self._backoff.trigger(resp.headers.get("Retry-After"))
+                self.log(f"Rate limited (429) on {filename}, attempt {rate_limit_retry + 1}/{max_rate_limit_retries} - "
+                         f"backing off {delay:.0f}s...", "WARNING")
+                self._backoff.wait_if_paused()
+                return self._download_file(group_id, subdir, file_meta, retry, rate_limit_retry + 1, max_rate_limit_retries)
             if "/login" in resp.url:
                 # Session expired mid-crawl (long historical crawls can outlast
                 # a session lifetime) - re-auth once and retry this file.
