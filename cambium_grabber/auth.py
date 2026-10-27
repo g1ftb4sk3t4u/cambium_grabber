@@ -13,6 +13,7 @@ has actually expired.
 """
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -98,6 +99,12 @@ def save_session(session: requests.Session, path: Path) -> None:
     ]
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"cookies": cookies}), encoding="utf-8")
+    # The cached cookies are a logged-in session - as good as the password
+    # to anyone who can read them, so keep the file owner-only.
+    try:
+        os.chmod(str(tmp), 0o600)
+    except OSError:
+        pass
     tmp.replace(path)
 
 

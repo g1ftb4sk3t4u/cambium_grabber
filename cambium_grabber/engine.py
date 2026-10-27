@@ -15,6 +15,7 @@ together instead of each thread independently retrying and immediately
 re-triggering the same limit.
 """
 
+import os
 import re
 import threading
 import time
@@ -544,12 +545,17 @@ class Engine:
         """
         filename = _sanitize(file_meta.filename)
         out_path = subdir / filename
+        # Downloads land in a .part file and are only renamed into place once
+        # complete, so a kill, crash, or full disk mid-file can never leave a
+        # truncated file under the real name for later runs to skip as "done".
+        part_path = out_path.with_name(filename + ".part")
 
-        if out_path.exists() and out_path.stat().st_size > 0:
-            if not self.manifest.has_file(group_id, filename):
-                size = out_path.stat().st_size
-                rel_path = str(out_path.relative_to(self.output_dir))
-                self.manifest.record_file(group_id, filename, size, rel_path, file_meta.url)
+        if self._have_complete_copy(group_id, filename, out_path, file_meta):
+            try:
+                if part_path.exists():
+                    part_path.unlink()
+            except OSError:
+                pass
             self._emit("stat", key="files_skipped", amount=1)
             self.manifest.bump_stat("files_skipped")
             return True
@@ -578,10 +584,18 @@ class Engine:
                 auth.save_session(self.session, self.session_cache)
                 resp = self.session.get(file_meta.url, timeout=60, stream=True)
             resp.raise_for_status()
+            # A login/error page coming back 200 instead of the file would
+            # otherwise be saved under the firmware's filename.
+            content_type = resp.headers.get("Content-Type", "")
+            if "/login" in resp.url or (content_type.startswith("text/html")
+                                        and not filename.lower().endswith((".htm", ".html"))):
+                raise requests.RequestException(f"got a web page instead of the file (session problem?): {resp.url}")
+            expected = resp.headers.get("Content-Length")
+            encoded = resp.headers.get("Content-Encoding", "identity") != "identity"
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
             downloaded = 0
-            with open(out_path, "wb") as f:
+            with open(part_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=64 * 1024):
                     if not chunk:
                         continue
@@ -591,6 +605,13 @@ class Engine:
                     downloaded += len(chunk)
                     if self._stopped():
                         break
+
+            if self._stopped():
+                part_path.unlink()
+                return False
+            if expected is not None and not encoded and downloaded != int(expected):
+                raise requests.RequestException(f"incomplete download ({downloaded} of {expected} bytes)")
+            os.replace(str(part_path), str(out_path))
 
             rel_path = str(out_path.relative_to(self.output_dir))
             self.manifest.record_file(group_id, filename, downloaded, rel_path, file_meta.url)
@@ -607,13 +628,43 @@ class Engine:
                 time.sleep(backoff)
                 return self._download_file(group_id, subdir, file_meta, retry + 1)
             self.log(f"Failed: {filename}: {e}", "ERROR")
-            self.manifest.bump_stat("files_failed")
-            self._emit("stat", key="files_failed", amount=1)
-            with self._progress_lock:
-                self._failed_files.append({"group": group_id, "filename": filename, "error": str(e)})
-            try:
-                if out_path.exists():
-                    out_path.unlink()
-            except OSError:
-                pass
+            error = str(e)
+        except OSError as e:
+            # Disk full / permissions - retrying won't help, so fail this file
+            # cleanly instead of leaving a partial file behind.
+            self.log(f"Failed writing {filename}: {e}", "ERROR")
+            error = str(e)
+
+        self.manifest.bump_stat("files_failed")
+        self._emit("stat", key="files_failed", amount=1)
+        with self._progress_lock:
+            self._failed_files.append({"group": group_id, "filename": filename, "error": error})
+        try:
+            if part_path.exists():
+                part_path.unlink()
+        except OSError:
+            pass
+        return False
+
+    def _have_complete_copy(self, group_id: str, filename: str, out_path: Path, file_meta) -> bool:
+        """True if a complete copy of this file is already on disk.
+
+        A file the manifest recorded at this exact size is trusted as-is.
+        Anything else (copied in by hand, or cut short by a crash or a full
+        disk under an older version of this tool) is compared once against
+        the size the release page lists; one well short of it is treated
+        as incomplete and downloaded again. The page shows rounded sizes
+        ("210.3 MB"), hence the 10% margin rather than an exact match.
+        """
+        if not (out_path.exists() and out_path.stat().st_size > 0):
             return False
+        size = out_path.stat().st_size
+        if self.manifest.has_file(group_id, filename, expected_size=size):
+            return True
+        listed = parse_size(file_meta.size_text)
+        if listed and size < listed * 0.9:
+            self.log(f"Incomplete file on disk, re-downloading: {out_path.relative_to(self.output_dir)} "
+                     f"({format_size(size)} of ~{format_size(listed)})", "WARNING")
+            return False
+        self.manifest.record_file(group_id, filename, size, str(out_path.relative_to(self.output_dir)), file_meta.url)
+        return True

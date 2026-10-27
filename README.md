@@ -225,6 +225,21 @@ the MikroTik tool's manifest shape) rather than a version string, since
 Cambium organizes by product + release rather than one flat version number
 the way RouterOS does.
 
+## Checking files already on disk
+
+Every run checks what's already in the archive before downloading:
+
+- A file the manifest recorded at the same size is trusted as-is.
+- Anything else (copied in by hand, or left by an older version of this
+  tool) is compared once against the size listed on the release page. One
+  well short of it (more than 10% under; the page rounds sizes) means an
+  interrupted download, so it's fetched again.
+- Downloads are written to `<file>.part` and only renamed once complete,
+  so a crash, kill, or full disk never leaves a truncated file behind.
+- A web page coming back where a file was expected (an expired session's
+  login page, say) is treated as a failed download, not saved as firmware.
+- The cached `.session.json` is written owner-only (mode 600).
+
 ## Known limitations / things to verify before relying on this
 
 - **Login flow is a plain 2-step form POST** (email, then password) as of
